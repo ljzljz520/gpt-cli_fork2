@@ -1,11 +1,12 @@
+from typing import List, Optional
+
 from gptcli.assistant import Assistant
-from gptcli.completion import Message, UsageEvent
+from gptcli.completion import Citation, Message, UsageEvent
 from gptcli.session import ChatListener
 
 from rich.console import Console
 
 import logging
-from typing import List, Optional
 
 
 class PriceChatListener(ChatListener):
@@ -23,6 +24,7 @@ class PriceChatListener(ChatListener):
         messages: List[Message],
         response: Message,
         usage: Optional[UsageEvent] = None,
+        citations: Optional[List[Citation]] = None,
     ):
         if usage is None:
             return

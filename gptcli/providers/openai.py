@@ -1,15 +1,17 @@
 import re
-from typing import Iterator, List, Optional, cast
+from typing import Dict, Iterator, List, Optional, Tuple, cast
 import openai
 from openai import OpenAI
 from openai.types.responses import ResponseInputParam
 
 from gptcli.completion import (
+    Citation,
     CompletionEvent,
     CompletionProvider,
     Message,
     CompletionError,
     BadRequestError,
+    CitationsEvent,
     MessageDeltaEvent,
     Pricing,
     ThinkingDeltaEvent,
@@ -20,6 +22,54 @@ from gptcli.completion import (
 
 def is_reasoning_model(model: str) -> bool:
     return model.startswith("o1") or model.startswith("o3") or model.startswith("o4")
+
+
+def _dedupe_citations(citations: List[Citation]) -> List[Citation]:
+    seen = set()
+    unique = []
+    for citation in citations:
+        key = (citation.url, citation.start_index, citation.end_index)
+        if key not in seen:
+            seen.add(key)
+            unique.append(citation)
+    return unique
+
+
+def extract_url_citations(response) -> List[Citation]:
+    """Collect ``url_citation`` annotations from a Responses API ``Response``.
+
+    The provider's ``start_index``/``end_index`` are character offsets relative to
+    the output *message* item they belong to. When a response contains several
+    output message items we shift each citation by the total length of the
+    preceding message text, so every returned offset points into the aggregated
+    response text (i.e. ``response.output_text`` and the concatenated
+    ``message_delta`` events). Offsets are Python character indices and therefore
+    correct for Chinese and other multi-byte text.
+    """
+    citations: List[Citation] = []
+    text_offset = 0
+    for item in getattr(response, "output", None) or []:
+        if getattr(item, "type", None) != "message":
+            continue
+        text_parts = [
+            part
+            for part in getattr(item, "content", []) or []
+            if getattr(part, "type", None) == "output_text"
+        ]
+        for part in text_parts:
+            for annotation in getattr(part, "annotations", None) or []:
+                if getattr(annotation, "type", None) != "url_citation":
+                    continue
+                citations.append(
+                    Citation(
+                        url=annotation.url,
+                        title=annotation.title,
+                        start_index=text_offset + annotation.start_index,
+                        end_index=text_offset + annotation.end_index,
+                    )
+                )
+        text_offset += sum(len(part.text) for part in text_parts)
+    return _dedupe_citations(citations)
 
 
 class OpenAICompletionProvider(CompletionProvider):
@@ -60,26 +110,77 @@ class OpenAICompletionProvider(CompletionProvider):
                     **kwargs,
                 )
 
+                # Annotations can arrive in their own events, potentially after
+                # the text they annotate. Keep them as a fallback; the terminal
+                # `response.completed` event remains the authoritative source.
+                stashed_annotations: Dict[Tuple[int, int, int], object] = {}
+                item_text_lengths: Dict[int, int] = {}
+                citations_emitted = False
+
                 for response in response_iter:
                     if response.type == "response.output_text.delta":
                         yield MessageDeltaEvent(response.delta)
+                        item_text_lengths[response.output_index] = (
+                            item_text_lengths.get(response.output_index, 0)
+                            + len(response.delta)
+                        )
                     elif response.type == "response.reasoning_summary_text.delta":
                         yield ThinkingDeltaEvent(response.delta)
                     elif response.type == "response.reasoning_summary_part.done":
                         yield ThinkingDeltaEvent("\n\n")
                     elif response.type == "response.web_search_call.in_progress":
                         yield ToolCallEvent("Searching the web...")
-                    elif response.type == "response.completed" and (
-                        pricing := gpt_pricing(args["model"])
-                    ):
-                        if response.response.usage:
-                            yield UsageEvent.with_pricing(
-                                prompt_tokens=response.response.usage.input_tokens,
-                                completion_tokens=response.response.usage.output_tokens,
-                                total_tokens=response.response.usage.input_tokens
-                                + response.response.usage.output_tokens,
-                                pricing=pricing,
+                    elif response.type == "response.output_text.annotation.added":
+                        annotation = response.annotation
+                        if getattr(annotation, "type", None) == "url_citation":
+                            stashed_annotations[
+                                (
+                                    response.output_index,
+                                    response.content_index,
+                                    response.annotation_index,
+                                )
+                            ] = annotation
+                    elif response.type == "response.completed":
+                        citations = extract_url_citations(response.response)
+                        if citations:
+                            citations_emitted = True
+                            yield CitationsEvent(citations)
+                        if pricing := gpt_pricing(args["model"]):
+                            if response.response.usage:
+                                yield UsageEvent.with_pricing(
+                                    prompt_tokens=response.response.usage.input_tokens,
+                                    completion_tokens=response.response.usage.output_tokens,
+                                    total_tokens=response.response.usage.input_tokens
+                                    + response.response.usage.output_tokens,
+                                    pricing=pricing,
+                                )
+
+                if not citations_emitted and stashed_annotations:
+                    # Defensive fallback for streams that end without a
+                    # `response.completed` payload: rebuild global offsets from
+                    # the per-output-item text lengths observed in delta events.
+                    fallback_citations = []
+                    for (
+                        output_index,
+                        _,
+                        _,
+                    ), annotation in sorted(stashed_annotations.items()):
+                        base_offset = sum(
+                            length
+                            for index, length in item_text_lengths.items()
+                            if index < output_index
+                        )
+                        fallback_citations.append(
+                            Citation(
+                                url=annotation.url,
+                                title=annotation.title,
+                                start_index=base_offset + annotation.start_index,
+                                end_index=base_offset + annotation.end_index,
                             )
+                        )
+                    fallback_citations = _dedupe_citations(fallback_citations)
+                    if fallback_citations:
+                        yield CitationsEvent(fallback_citations)
             else:
                 response = self.client.responses.create(
                     model=model,
@@ -90,6 +191,10 @@ class OpenAICompletionProvider(CompletionProvider):
                 )
 
                 yield MessageDeltaEvent(response.output_text)
+
+                citations = extract_url_citations(response)
+                if citations:
+                    yield CitationsEvent(citations)
 
                 if response.usage and (pricing := gpt_pricing(args["model"])):
                     yield UsageEvent.with_pricing(

@@ -4,19 +4,31 @@ import sys
 import subprocess
 import tempfile
 from gptcli.assistant import Assistant
+from gptcli.cli import render_sources
 
 
-def simple_response(assistant: Assistant, prompt: str, stream: bool) -> None:
+def simple_response(
+    assistant: Assistant, prompt: str, stream: bool, show_sources: bool = False
+) -> None:
     messages = assistant.init_messages()
     messages.append({"role": "user", "content": prompt})
     logging.info("User: %s", prompt)
     response_iter = assistant.complete_chat(messages, stream=stream)
     result = ""
+    citations = []
     try:
         for response in response_iter:
             if response.type == "message_delta":
                 result += response.text
                 sys.stdout.write(response.text)
+            elif response.type == "citations":
+                citations = response.citations
+        # Piped output stays pure body text unless sources were explicitly
+        # requested. Footnotes are appended after the untouched body.
+        if show_sources and citations:
+            sys.stdout.write(
+                "\n\n" + render_sources(citations, result, markdown=False) + "\n"
+            )
     except KeyboardInterrupt:
         pass
     finally:

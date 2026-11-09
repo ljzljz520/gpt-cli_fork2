@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import List, Optional
 
 from openai import BadRequestError, OpenAIError
 from prompt_toolkit import PromptSession
@@ -10,7 +10,7 @@ from rich.live import Live
 from rich.markdown import Markdown
 from rich.text import Text
 
-from gptcli.completion import ToolCallEvent
+from gptcli.completion import Citation, ToolCallEvent
 from gptcli.session import (
     ALL_COMMANDS,
     COMMAND_CLEAR,
@@ -64,6 +64,54 @@ class StreamingMarkdownPrinter:
         self.console.print()
 
 
+def citation_snippet(
+    text: str, start_index: int, end_index: int, max_len: int = 120
+) -> str:
+    """Return the cited span of ``text``.
+
+    Indices are character offsets, so slicing is correct for Chinese and other
+    multi-byte text. Out-of-range indices are clamped rather than raising.
+    """
+    start = max(0, min(start_index, len(text)))
+    end = max(start, min(end_index, len(text)))
+    snippet = " ".join(text[start:end].split())
+    if len(snippet) > max_len:
+        snippet = snippet[: max_len - 1].rstrip() + "…"
+    return snippet
+
+
+def render_sources(
+    citations: List[Citation], response_text: str, markdown: bool
+) -> str:
+    """Build the footnote block shown *after* an answer.
+
+    The answer body itself is never modified: citations reference the original
+    text through their offsets and are rendered as a separate numbered list.
+    """
+    lines = ["**Sources:**" if markdown else "Sources:"]
+    seen = set()
+    number = 0
+    for citation in citations:
+        key = (citation.url, citation.start_index, citation.end_index)
+        if key in seen:
+            continue
+        seen.add(key)
+        number += 1
+        title = citation.title or citation.url
+        snippet = citation_snippet(
+            response_text, citation.start_index, citation.end_index
+        )
+        if markdown:
+            lines.append(f"{number}. [{title}]({citation.url})")
+            if snippet:
+                lines.append(f'   > "{snippet}"')
+        else:
+            lines.append(f"[{number}] {title} — {citation.url}")
+            if snippet:
+                lines.append(f'    "{snippet}"')
+    return "\n".join(lines)
+
+
 class CLIResponseStreamer(ResponseStreamer):
     def __init__(self, console: Console, markdown: bool):
         self.console = console
@@ -71,12 +119,17 @@ class CLIResponseStreamer(ResponseStreamer):
         self.printer = StreamingMarkdownPrinter(self.console, self.markdown)
         self.thinking_printer = None
         self.first_token = True
+        # Keep the unmodified streamed text so citation offsets can locate
+        # snippets even though the printer trims a leading space.
+        self.raw_text = ""
+        self.citations: List[Citation] = []
 
     def __enter__(self):
         self.printer.__enter__()
         return self
 
     def on_next_token(self, token: str):
+        self.raw_text += token
         if self.first_token and token.startswith(" "):
             token = token[1:]
         self.first_token = False
@@ -98,10 +151,21 @@ class CLIResponseStreamer(ResponseStreamer):
     def on_tool_call(self, tool_call: ToolCallEvent):
         self.console.print(f"[bold green]{tool_call.text}[/bold green]", end="\n")
 
+    def on_citations(self, citations: List[Citation]):
+        # Citations can arrive after the last text delta; defer rendering until
+        # the streamer exits so the live markdown view is not disturbed.
+        self.citations = citations
+
     def __exit__(self, *args):
         if self.thinking_printer:
             self.thinking_printer.__exit__(*args)
         self.printer.__exit__(*args)
+        if self.citations:
+            sources = render_sources(self.citations, self.raw_text, self.markdown)
+            if self.markdown:
+                self.console.print(Markdown(sources))
+            else:
+                self.console.print(Text(sources))
 
 
 class CLIChatListener(ChatListener):

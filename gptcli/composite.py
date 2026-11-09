@@ -1,4 +1,4 @@
-from gptcli.completion import Message, ToolCallEvent, UsageEvent
+from gptcli.completion import Citation, Message, ToolCallEvent, UsageEvent
 from gptcli.session import ChatListener, ResponseStreamer
 
 
@@ -25,6 +25,10 @@ class CompositeResponseStreamer(ResponseStreamer):
     def on_tool_call(self, tool_call: ToolCallEvent):
         for streamer in self.streamers:
             streamer.on_tool_call(tool_call)
+
+    def on_citations(self, citations: List[Citation]):
+        for streamer in self.streamers:
+            streamer.on_citations(citations)
 
     def __exit__(self, *args):
         for streamer in self.streamers:
@@ -65,6 +69,7 @@ class CompositeChatListener(ChatListener):
         messages: List[Message],
         response: Message,
         usage: Optional[UsageEvent],
+        citations: Optional[List[Citation]] = None,
     ):
         for listener in self.listeners:
-            listener.on_chat_response(messages, response, usage)
+            listener.on_chat_response(messages, response, usage, citations=citations)

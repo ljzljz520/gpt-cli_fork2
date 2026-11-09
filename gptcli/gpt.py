@@ -140,6 +140,13 @@ before executing it. Implies --no_stream. Use `-` to read the prompt from standa
 response in a script. Ignored when the --prompt option is not specified.",
     )
     parser.add_argument(
+        "--sources",
+        action="store_true",
+        default=False,
+        help="Append the web search sources (citations) returned with the answer to standard output. Only applies \
+when --prompt is specified. Without this flag, piped output contains the response body only.",
+    )
+    parser.add_argument(
         "--no_price",
         action="store_false",
         dest="show_price",
@@ -236,7 +243,12 @@ def run_non_interactive(args, assistant):
     if "-" in args.prompt:
         args.prompt[args.prompt.index("-")] = "".join(sys.stdin.readlines())
 
-    simple_response(assistant, "\n".join(args.prompt), stream=not args.no_stream)
+    simple_response(
+        assistant,
+        "\n".join(args.prompt),
+        stream=not args.no_stream,
+        show_sources=args.sources,
+    )
 
 
 class CLIChatSession(ChatSession):

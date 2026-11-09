@@ -1,5 +1,5 @@
 from abc import abstractmethod
-from typing import Iterator, List, Literal, TypedDict, Union
+from typing import Iterator, List, Literal, Optional, TypedDict, Union
 
 from attr import dataclass
 
@@ -7,6 +7,27 @@ from attr import dataclass
 class Message(TypedDict):
     role: str
     content: str
+
+
+@dataclass
+class Citation:
+    """A web source citation attached to a span of the response text.
+
+    ``start_index`` and ``end_index`` are Python character (Unicode code point)
+    offsets into the full, unmodified response text, so slicing works correctly
+    for non-ASCII text such as Chinese.
+    """
+
+    url: str
+    start_index: int
+    end_index: int
+    title: Optional[str] = None
+
+
+@dataclass
+class CitationsEvent:
+    citations: List[Citation]
+    type: Literal["citations"] = "citations"
 
 
 class Pricing(TypedDict):
@@ -54,7 +75,7 @@ class UsageEvent:
 
 
 CompletionEvent = Union[
-    MessageDeltaEvent, ThinkingDeltaEvent, UsageEvent, ToolCallEvent
+    MessageDeltaEvent, ThinkingDeltaEvent, UsageEvent, ToolCallEvent, CitationsEvent
 ]
 
 

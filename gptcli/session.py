@@ -1,6 +1,7 @@
 from abc import abstractmethod
 from gptcli.assistant import Assistant
 from gptcli.completion import (
+    Citation,
     Message,
     CompletionError,
     BadRequestError,
@@ -21,6 +22,9 @@ class ResponseStreamer:
         pass
 
     def on_tool_call(self, tool_call: ToolCallEvent):
+        pass
+
+    def on_citations(self, citations: List[Citation]):
         pass
 
     def __exit__(self, *args):
@@ -51,6 +55,7 @@ class ChatListener:
         messages: List[Message],
         response: Message,
         usage: Optional[UsageEvent] = None,
+        citations: Optional[List[Citation]] = None,
     ):
         pass
 
@@ -89,12 +94,19 @@ class ChatSession:
     ):
         self.assistant = assistant
         self.messages: List[Message] = assistant.init_messages()
+        # Citations are kept outside of ``messages`` so the body sent back to
+        # the model is never rewritten with footnote markup. Entries are aligned
+        # one-to-one with ``messages`` (``None`` for messages without citations).
+        self.message_citations: List[Optional[List[Citation]]] = [None] * len(
+            self.messages
+        )
         self.user_prompts: List[Message] = []
         self.listener = listener
         self.stream = stream
 
     def _clear(self):
         self.messages = self.assistant.init_messages()
+        self.message_citations = [None] * len(self.messages)
         self.user_prompts = []
         self.listener.on_chat_clear()
 
@@ -105,6 +117,7 @@ class ChatSession:
 
         if self.messages[-1]["role"] == "assistant":
             self.messages = self.messages[:-1]
+            self.message_citations = self.message_citations[:-1]
 
         self.listener.on_chat_rerun(True)
         self._respond()
@@ -114,6 +127,7 @@ class ChatSession:
         Respond to the user's input and return whether the assistant's response was saved.
         """
         next_response: str = ""
+        citations: List[Citation] = []
         usage: Optional[UsageEvent] = None
         try:
             completion_iter = self.assistant.complete_chat(
@@ -131,6 +145,16 @@ class ChatSession:
                         stream.on_tool_call(event)
                     elif event.type == "usage":
                         usage = event
+                    elif event.type == "citations":
+                        # A completion emits at most one citations event, and it
+                        # is rebuilt from scratch on every run, so a rerun can
+                        # never mix in citations from the previous response.
+                        citations = event.citations
+
+                # Citations may arrive after the last text delta; render them
+                # only once the full response body has been streamed.
+                if citations:
+                    stream.on_citations(citations)
 
         except KeyboardInterrupt:
             # If the user interrupts the chat completion, we'll just return what we have so far
@@ -144,19 +168,26 @@ class ChatSession:
 
         next_message: Message = {"role": "assistant", "content": next_response}
         self.listener.on_chat_message(next_message)
-        self.listener.on_chat_response(self.messages, next_message, usage)
+        self.listener.on_chat_response(
+            self.messages, next_message, usage, citations=citations
+        )
 
         self.messages = self.messages + [next_message]
+        self.message_citations = self.message_citations + [
+            citations if citations else None
+        ]
         return True
 
     def _add_user_message(self, user_input: str):
         user_message: Message = {"role": "user", "content": user_input}
         self.messages = self.messages + [user_message]
+        self.message_citations = self.message_citations + [None]
         self.listener.on_chat_message(user_message)
         self.user_prompts.append(user_message)
 
     def _rollback_user_message(self):
         self.messages = self.messages[:-1]
+        self.message_citations = self.message_citations[:-1]
         self.user_prompts = self.user_prompts[:-1]
 
     def _print_help(self):
